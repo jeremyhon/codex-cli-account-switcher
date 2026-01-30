@@ -3,11 +3,12 @@ set -euo pipefail
 
 # codex-accounts.sh — manage multiple Codex CLI accounts
 # Storage layout:
-#   Zips:   ~/codex-data/<account>.zip
+#   Auths:  ~/codex-data/<account>.auth.json
 #   State:  ~/.codex-switch/state   (CURRENT=..., PREVIOUS=...)
 
 CODENAME="codex"
 CODEX_HOME="${HOME}/.codex"
+AUTH_FILE="${CODEX_HOME}/auth.json"
 DATA_DIR="${HOME}/codex-data"
 STATE_DIR="${HOME}/.codex-switch"
 STATE_FILE="${STATE_DIR}/state"
@@ -38,15 +39,23 @@ save_state() {
   printf "CURRENT=%q\nPREVIOUS=%q\n" "$cur" "$prev" > "$STATE_FILE"
 }
 
-zip_path_for() {
+auth_path_for() {
   local name="$1"
-  echo "${DATA_DIR}/${name}.zip"
+  echo "${DATA_DIR}/${name}.auth.json"
 }
 
 assert_codex_present_or_hint() {
   if [[ ! -d "$CODEX_HOME" ]]; then
     die "~/.codex not found. You likely haven't logged in yet.
 Install Codex:  brew install codex
+Then run:       ${CODENAME} login"
+  fi
+}
+
+assert_auth_present_or_hint() {
+  assert_codex_present_or_hint
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    die "~/.codex/auth.json not found. You likely haven't logged in yet.
 Then run:       ${CODENAME} login"
   fi
 }
@@ -59,47 +68,32 @@ prompt_account_name() {
 }
 
 backup_current_to() {
-  # Requires ~/.codex to exist
+  # Requires ~/.codex/auth.json to exist
   local name="$1"
-  assert_codex_present_or_hint
-  require_bin zip
+  assert_auth_present_or_hint
 
-  local tmpdir; tmpdir="$(mktemp -d)"
-  local dest; dest="$(zip_path_for "$name")"
+  local dest; dest="$(auth_path_for "$name")"
 
-  note "Saving current ~/.codex to ${dest}..."
-  cp -R "$CODEX_HOME" "${tmpdir}/.codex"
-  (
-    cd "$tmpdir"
-    zip -r -q "$dest" .codex
-  )
-  rm -rf "$tmpdir"
+  note "Saving current auth.json to ${dest}..."
+  cp -p "$AUTH_FILE" "$dest"
   ok "Saved."
 }
 
 extract_to_codex() {
-  local zipfile="$1"
-  require_bin unzip
+  local authfile="$1"
 
-  [[ -f "$zipfile" ]] || die "Account archive not found: $zipfile"
+  [[ -f "$authfile" ]] || die "Account auth file not found: $authfile"
 
-  local tmpdir; tmpdir="$(mktemp -d)"
-  note "Extracting $(basename "$zipfile")..."
-  unzip -q "$zipfile" -d "$tmpdir"
-
-  local extracted; extracted="$(find "$tmpdir" -type d -name ".codex" | head -n1)"
-  [[ -z "${extracted:-}" ]] && { rm -rf "$tmpdir"; die ".codex folder missing inside archive."; }
-
-  rm -rf "$CODEX_HOME"
-  mv "$extracted" "$CODEX_HOME"
-  rm -rf "$tmpdir"
-  ok "Activated archive into ~/.codex."
+  note "Activating $(basename "$authfile")..."
+  mkdir -p "$CODEX_HOME"
+  cp -p "$authfile" "$AUTH_FILE"
+  ok "Activated auth.json into ~/.codex."
 }
 
 resolve_current_name_or_prompt() {
   # If CURRENT unknown but ~/.codex exists, ask user to name it so we can save it.
   load_state
-  if [[ -z "${CURRENT:-}" && -d "$CODEX_HOME" ]]; then
+  if [[ -z "${CURRENT:-}" && -f "$AUTH_FILE" ]]; then
     local named; named="$(prompt_account_name)"
     backup_current_to "$named"
     PREVIOUS=""        # No meaningful previous yet
@@ -113,9 +107,9 @@ cmd_list() {
   ensure_dirs
   shopt -s nullglob
   local any=0
-  for f in "$DATA_DIR"/*.zip; do
+  for f in "$DATA_DIR"/*.auth.json; do
     any=1
-    echo " - $(basename "${f%%.zip}" .zip)"
+    echo " - $(basename "${f%%.auth.json}" .auth.json)"
   done
   [[ $any -eq 0 ]] && echo "(no accounts saved yet)"
 }
@@ -135,7 +129,7 @@ cmd_current() {
 cmd_save() {
   # Save the *currently logged-in* ~/.codex under a name
   ensure_dirs
-  assert_codex_present_or_hint
+  assert_auth_present_or_hint
   local name="${1:-}"
   if [[ -z "$name" ]]; then
     name="$(prompt_account_name)"
@@ -152,16 +146,16 @@ cmd_save() {
 cmd_add() {
   # Add a NEW account slot:
   #  - If ~/.codex exists, back it up under CURRENT (or prompt for a name if unknown)
-  #  - Clear ~/.codex so user can run `codex login` for the NEW name
-  #  - Do NOT create the zip for the new one yet; that happens after they log in and run save/switch
+  #  - Clear auth.json so user can run `codex login` for the NEW name
+  #  - Do NOT create the auth file for the new one yet; that happens after they log in and run save/switch
   ensure_dirs
   resolve_current_name_or_prompt   # backs up & sets CURRENT if needed
 
   local newname="${1:-}"; [[ -z "$newname" ]] && die "Usage: $0 add <new-account-name>"
 
-  if [[ -d "$CODEX_HOME" ]]; then
-    note "Clearing ~/.codex to prepare login for '${newname}'..."
-    rm -rf "$CODEX_HOME"
+  if [[ -f "$AUTH_FILE" ]]; then
+    note "Clearing ~/.codex/auth.json to prepare login for '${newname}'..."
+    rm -f "$AUTH_FILE"
   fi
   ok "Ready. Now run: ${CODENAME} login  (to authenticate '${newname}')"
   echo "After login completes, run: $0 save ${newname}   (to store the new account)"
@@ -169,18 +163,18 @@ cmd_add() {
 
 cmd_switch() {
   # Switch to an existing saved account by name:
-  #  - Ensure the target zip exists
+  #  - Ensure the target auth exists
   #  - If ~/.codex exists, back it up under CURRENT (or prompt to name it)
-  #  - Extract the target into ~/.codex
+  #  - Copy the target auth.json into ~/.codex
   local target="${1:-}"; [[ -z "$target" ]] && die "Usage: $0 switch <account-name>"
 
   ensure_dirs
   resolve_current_name_or_prompt   # may back up and set CURRENT if previously unknown
 
-  local zipfile; zipfile="$(zip_path_for "$target")"
-  [[ -f "$zipfile" ]] || die "No saved account named '${target}'. Use '$0 list' to see options."
+  local authfile; authfile="$(auth_path_for "$target")"
+  [[ -f "$authfile" ]] || die "No saved account named '${target}'. Use '$0 list' to see options."
 
-  if [[ -d "$CODEX_HOME" ]]; then
+  if [[ -f "$AUTH_FILE" ]]; then
     # Always back up current before switching
     load_state
     if [[ -z "${CURRENT:-}" ]]; then
@@ -191,7 +185,7 @@ cmd_switch() {
   fi
 
   note "Switching to '${target}'..."
-  extract_to_codex "$zipfile"
+  extract_to_codex "$authfile"
 
   # Update state
   load_state
@@ -213,13 +207,13 @@ USAGE
       Show current and previous accounts from the state.
 
   $0 save [<name>]
-      Zip the current ~/.codex into ${DATA_DIR}/<name>.zip.
+      Copy the current ~/.codex/auth.json into ${DATA_DIR}/<name>.auth.json.
       If <name> is omitted, you'll be prompted.
 
   $0 add <name>
       Prepare to add a new account:
         - backs up current (prompting for its name if unknown),
-        - clears ~/.codex so you can run 'codex login',
+        - clears ~/.codex/auth.json so you can run 'codex login',
         - after login, run: $0 save <name>
 
   $0 switch <name>
@@ -227,7 +221,7 @@ USAGE
       Backs up current first, then activates <name>.
 
 NOTES
-  - Requires 'zip' and 'unzip'.
+  - Uses only ~/.codex/auth.json; other ~/.codex files are left untouched.
   - If ~/.codex is missing when saving/adding, you'll be prompted to login first.
   - Install Codex if needed:  brew install codex
 EOF
@@ -235,8 +229,6 @@ EOF
 
 # ------------- main -------------
 main() {
-  require_bin zip
-  require_bin unzip
   ensure_dirs
 
   local cmd="${1:-help}"; shift || true

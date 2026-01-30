@@ -3,7 +3,7 @@
 **Easily manage multiple OpenAI Codex CLI accounts — switch, save, and restore with one command.**
 
 The official [OpenAI Codex CLI](https://github.com/openai/codex) does **not support multi-account login**.  
-Users must manually swap `~/.codex` folders or re-authenticate every time they switch accounts — a painful process for developers who use multiple OpenAI accounts (for example, personal vs work).
+Users must manually swap `~/.codex/auth.json` or re-authenticate every time they switch accounts — a painful process for developers who use multiple OpenAI accounts (for example, personal vs work).
 
 I raised this issue here: [#4432](https://github.com/openai/codex/issues/4432)  
 and also created a pull request adding multi-account support: [#4457](https://github.com/openai/codex/pull/4457)  
@@ -49,19 +49,19 @@ codex-accounts switch bashar
 ```
 ## 📁 Data Locations
 Codex stores its session data inside `~/.codex`.
-This script backs up each account’s `.codex` directory as a compressed zip file and lets you swap them instantly.
+This script backs up each account’s `auth.json` file and lets you swap it instantly.
 
 | Path                      | Purpose                              |
 | ------------------------- | ------------------------------------ |
-| `~/.codex`                | Active Codex session folder          |
-| `~/codex-data/<name>.zip` | Saved account backups                |
-| `~/.codex-switch/state`   | Tracks current and previous accounts |
+| `~/.codex`                      | Active Codex session folder          |
+| `~/codex-data/<name>.auth.json` | Saved account backups                |
+| `~/.codex-switch/state`         | Tracks current and previous accounts |
 
-It’s safe to use — your Codex configuration is preserved before every switch.
+It’s safe to use — only `auth.json` is swapped; other Codex files are left untouched.
 
 ## ⚙️ Requirements
 - macOS / Linux
-- `zip`, `unzip`, `bash`
+- `bash`
 - Codex CLI installed:
   - macOS: `brew install codex`
   - Linux: use your package manager or follow the [Codex CLI docs](https://developers.openai.com/codex/cli/)
@@ -71,6 +71,6 @@ It’s safe to use — your Codex configuration is preserved before every switch
 - Automatically backs up the current account before changing.
 - Shows the current and previous account states.
 - Works cross-platform: macOS, Linux, WSL.
-- Simple shell-only dependencies (`bash`, `zip`, `unzip`).
+- Simple shell-only dependency (`bash`).
 - Helpful prompts if Codex isn’t installed or logged in yet.
 - You can safely share this across machines (just copy `~/codex-data`).
