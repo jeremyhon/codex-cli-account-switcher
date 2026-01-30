@@ -224,8 +224,149 @@ PY
   printf '%s\n' "$output" | sed '/^$/d'
 }
 
+usage_quota_score_for_auth() {
+  # Output: "<score> <weekly_remaining> <fiveh_remaining>" (ints), or empty on failure.
+  local auth_file="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
 
+  python3 - "$auth_file" "$CODEX_HOME/config.toml" <<'PY'
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
 
+auth_file = sys.argv[1]
+config_file = sys.argv[2]
+
+try:
+    with open(auth_file, "r", encoding="utf-8") as f:
+        auth = json.load(f)
+except Exception:
+    sys.exit(0)
+
+tokens = auth.get("tokens") or {}
+access_token = tokens.get("access_token") or ""
+account_id = tokens.get("account_id") or ""
+if not access_token:
+    sys.exit(0)
+
+base_url = "https://chatgpt.com/backend-api"
+if os.path.exists(config_file):
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"chatgpt_base_url\s*=\s*(['\"])(.*?)\1", line)
+                if m:
+                    base_url = m.group(2)
+                    break
+    except Exception:
+        pass
+
+base_url = base_url.rstrip("/")
+if (base_url.startswith("https://chatgpt.com") or base_url.startswith("https://chat.openai.com")) and "/backend-api" not in base_url:
+    base_url = f"{base_url}/backend-api"
+
+path = "/wham/usage" if "/backend-api" in base_url else "/api/codex/usage"
+url = f"{base_url}{path}"
+
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "User-Agent": "codex-cli",
+}
+if account_id:
+    headers["ChatGPT-Account-Id"] = account_id
+
+req = urllib.request.Request(url, headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8")
+except Exception:
+    sys.exit(0)
+
+try:
+    payload = json.loads(body)
+except Exception:
+    sys.exit(0)
+
+rate_limit = payload.get("rate_limit") or {}
+
+def remaining_percent(window):
+    if not isinstance(window, dict):
+        return None
+    used = window.get("used_percent")
+    if used is None:
+        return None
+    try:
+        remaining = 100.0 - float(used)
+    except Exception:
+        return None
+    if remaining < 0:
+        remaining = 0.0
+    if remaining > 100:
+        remaining = 100.0
+    return int(round(remaining))
+
+fiveh_remaining = remaining_percent(rate_limit.get("primary_window"))
+weekly_remaining = remaining_percent(rate_limit.get("secondary_window"))
+
+if fiveh_remaining is None and weekly_remaining is None:
+    sys.exit(0)
+
+fiveh_remaining = fiveh_remaining if fiveh_remaining is not None else 0
+weekly_remaining = weekly_remaining if weekly_remaining is not None else 0
+
+# Heuristic: weekly counts double.
+score = weekly_remaining * 2 + fiveh_remaining
+print(f"{score} {weekly_remaining} {fiveh_remaining}")
+PY
+}
+
+pick_best_account_by_quota() {
+  ensure_dirs
+  shopt -s nullglob
+
+  local best_name=""
+  local best_score=-1
+  local best_weekly=-1
+  local best_fiveh=-1
+
+  for f in "$DATA_DIR"/*.auth.json; do
+    local name; name="$(basename "${f%%.auth.json}" .auth.json)"
+    local line=""
+    line="$(usage_quota_score_for_auth "$f" || true)"
+    [[ -z "$line" ]] && continue
+
+    local score weekly fiveh
+    read -r score weekly fiveh <<<"$line"
+    [[ -z "${score:-}" ]] && continue
+
+    if (( score > best_score )); then
+      best_score=$score
+      best_weekly=$weekly
+      best_fiveh=$fiveh
+      best_name="$name"
+    elif (( score == best_score )); then
+      if (( weekly > best_weekly )); then
+        best_weekly=$weekly
+        best_fiveh=$fiveh
+        best_name="$name"
+      elif (( weekly == best_weekly && fiveh > best_fiveh )); then
+        best_fiveh=$fiveh
+        best_name="$name"
+      fi
+    fi
+  done
+
+  [[ -n "$best_name" ]] || return 1
+  echo "$best_name"
+}
 
 print_usage_summary_for_auth() {
   local auth_file="$1"
@@ -365,7 +506,11 @@ cmd_switch() {
   #  - Ensure the target auth exists
   #  - If ~/.codex exists, back it up under CURRENT (or prompt to name it)
   #  - Copy the target auth.json into ~/.codex
-  local target="${1:-}"; [[ -z "$target" ]] && die "Usage: $0 switch <account-name>"
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    target="$(pick_best_account_by_quota)" || die "Unable to determine best account (usage unavailable). Provide a name."
+    note "Auto-selecting account with most available quota: ${target}"
+  fi
 
   ensure_dirs
   resolve_current_name_or_prompt   # may back up and set CURRENT if previously unknown
@@ -373,9 +518,14 @@ cmd_switch() {
   local authfile; authfile="$(auth_path_for "$target")"
   [[ -f "$authfile" ]] || die "No saved account named '${target}'. Use '$0 list' to see options."
 
+  load_state
+  if [[ -n "${CURRENT:-}" && "$CURRENT" == "$target" ]]; then
+    ok "Already on account with most available quota: ${CURRENT}"
+    return 0
+  fi
+
   if [[ -f "$AUTH_FILE" ]]; then
     # Always back up current before switching
-    load_state
     if [[ -z "${CURRENT:-}" ]]; then
       # Should not happen after resolve_current_name_or_prompt, but double-guard:
       CURRENT="$(prompt_account_name)"
@@ -415,14 +565,16 @@ USAGE
         - clears ~/.codex/auth.json so you can run 'codex login',
         - after login, run: $0 save <name>
 
-  $0 switch <name>
-      Switch to an existing saved account (name is mandatory).
+  $0 switch [<name>]
+      Switch to an existing saved account (name is optional).
       Backs up current first, then activates <name>.
+      If <name> is omitted, auto-selects the account with the most
+      available quota (weekly weighted heavier than 5h).
 
 NOTES
   - Uses only ~/.codex/auth.json; other ~/.codex files are left untouched.
   - If ~/.codex is missing when saving/adding, you'll be prompted to login first.
-  - Usage output requires ChatGPT login tokens; API-key-only logins won’t show usage.
+  - Usage output requires ChatGPT login tokens; API-key-only logins won't show usage.
   - Install Codex if needed:  brew install codex
 EOF
 }
