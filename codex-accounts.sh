@@ -60,6 +60,185 @@ Then run:       ${CODENAME} login"
   fi
 }
 
+usage_status_lines_for_auth() {
+  # Best-effort: fetch usage directly from the Codex backend (/usage).
+  local auth_file="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    note "python3 not found; skipping usage." >&2
+    return 0
+  fi
+
+  local output=""
+  output="$(
+    python3 - "$auth_file" "$CODEX_HOME/config.toml" <<'PY'
+import datetime as dt
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+def warn(msg: str) -> None:
+    sys.stderr.write(f"[*] {msg}\n")
+
+auth_file = sys.argv[1]
+config_file = sys.argv[2]
+
+try:
+    with open(auth_file, "r", encoding="utf-8") as f:
+        auth = json.load(f)
+except FileNotFoundError:
+    warn("~/.codex/auth.json not found; skipping usage.")
+    sys.exit(0)
+except Exception as e:
+    warn(f"Unable to read auth.json: {e}")
+    sys.exit(0)
+
+tokens = auth.get("tokens") or {}
+access_token = tokens.get("access_token") or ""
+account_id = tokens.get("account_id") or ""
+
+if not access_token:
+    if auth.get("OPENAI_API_KEY"):
+        warn("Usage is only available for ChatGPT login tokens; skipping.")
+    else:
+        warn("No ChatGPT access token found in auth.json; skipping usage.")
+    sys.exit(0)
+
+base_url = "https://chatgpt.com/backend-api"
+if os.path.exists(config_file):
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                m = re.match(r"chatgpt_base_url\s*=\s*(['\"])(.*?)\1", line)
+                if m:
+                    base_url = m.group(2)
+                    break
+    except Exception:
+        pass
+
+base_url = base_url.rstrip("/")
+if (base_url.startswith("https://chatgpt.com") or base_url.startswith("https://chat.openai.com")) and "/backend-api" not in base_url:
+    base_url = f"{base_url}/backend-api"
+
+path = "/wham/usage" if "/backend-api" in base_url else "/api/codex/usage"
+url = f"{base_url}{path}"
+
+headers = {
+    "Authorization": f"Bearer {access_token}",
+    "User-Agent": "codex-cli",
+}
+if account_id:
+    headers["ChatGPT-Account-Id"] = account_id
+
+req = urllib.request.Request(url, headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        body = resp.read().decode("utf-8")
+except urllib.error.HTTPError as e:
+    warn(f"Usage request failed: HTTP {e.code}")
+    sys.exit(0)
+except Exception as e:
+    warn(f"Usage request failed: {e}")
+    sys.exit(0)
+
+try:
+    payload = json.loads(body)
+except Exception as e:
+    warn(f"Unable to parse usage response: {e}")
+    sys.exit(0)
+
+rate_limit = payload.get("rate_limit") or {}
+
+def label_for_seconds(seconds, fallback):
+    if not seconds:
+        return fallback
+    minutes = max(0, int(seconds // 60))
+    minutes_per_hour = 60
+    minutes_per_day = 24 * minutes_per_hour
+    minutes_per_week = 7 * minutes_per_day
+    minutes_per_month = 30 * minutes_per_day
+    rounding_bias = 3
+
+    if minutes <= minutes_per_day + rounding_bias:
+        hours = max(1, (minutes + rounding_bias) // minutes_per_hour)
+        return f"{hours}h"
+    if minutes <= minutes_per_week + rounding_bias:
+        return "weekly"
+    if minutes <= minutes_per_month + rounding_bias:
+        return "monthly"
+    return "annual"
+
+def pretty_label(label):
+    if not label:
+        return label
+    return label[0].upper() + label[1:] if label[0].isalpha() else label
+
+def format_reset(reset_at):
+    if reset_at is None:
+        return None
+    try:
+        dt_reset = dt.datetime.fromtimestamp(int(reset_at), tz=dt.timezone.utc).astimezone()
+    except Exception:
+        return None
+    now = dt.datetime.now().astimezone()
+    time = dt_reset.strftime("%H:%M")
+    if dt_reset.date() == now.date():
+        return time
+    day = dt_reset.strftime("%d").lstrip("0")
+    month = dt_reset.strftime("%b")
+    return f"{time} on {day} {month}"
+
+def format_window(window, fallback_label):
+    if not isinstance(window, dict):
+        return None
+    used = window.get("used_percent")
+    if used is None:
+        return None
+    label = pretty_label(label_for_seconds(window.get("limit_window_seconds"), fallback_label))
+    reset = format_reset(window.get("reset_at"))
+    if reset:
+        return f"{label} limit: {used}% used (resets {reset})"
+    return f"{label} limit: {used}% used"
+
+lines = []
+primary = format_window(rate_limit.get("primary_window"), "5h")
+secondary = format_window(rate_limit.get("secondary_window"), "weekly")
+if primary:
+    lines.append(primary)
+if secondary:
+    lines.append(secondary)
+
+if lines:
+    print("\n".join(lines))
+PY
+  )"
+
+  if [[ -z "${output//[[:space:]]/}" ]]; then
+    return 0
+  fi
+  printf '%s\n' "$output" | sed '/^$/d'
+}
+
+
+
+
+print_usage_summary_for_auth() {
+  local auth_file="$1"
+  local lines=""
+  lines="$(usage_status_lines_for_auth "$auth_file")"
+  if [[ -n "$lines" ]]; then
+    echo "  Usage:"
+    printf '%s\n' "$lines" | sed 's/^/    /'
+  else
+    echo "  Usage: (unavailable)"
+  fi
+}
+
 prompt_account_name() {
   local ans
   read -r -p "Enter a name for the CURRENT logged-in account (e.g., bashar, tazrin): " ans
@@ -110,6 +289,7 @@ cmd_list() {
   for f in "$DATA_DIR"/*.auth.json; do
     any=1
     echo " - $(basename "${f%%.auth.json}" .auth.json)"
+    print_usage_summary_for_auth "$f"
   done
   [[ $any -eq 0 ]] && echo "(no accounts saved yet)"
 }
@@ -123,6 +303,25 @@ cmd_current() {
   fi
   if [[ -n "${PREVIOUS:-}" ]]; then
     echo "Previous: $PREVIOUS"
+  fi
+  if [[ -n "${CURRENT:-}" ]]; then
+    echo "Usage (current: ${CURRENT}):"
+    local lines=""
+    lines="$(usage_status_lines_for_auth "$AUTH_FILE")"
+    if [[ -n "$lines" ]]; then
+      printf '%s\n' "$lines" | sed 's/^/  /'
+    else
+      echo "  (unavailable)"
+    fi
+  else
+    echo "Usage (auth.json):"
+    local lines=""
+    lines="$(usage_status_lines_for_auth "$AUTH_FILE")"
+    if [[ -n "$lines" ]]; then
+      printf '%s\n' "$lines" | sed 's/^/  /'
+    else
+      echo "  (unavailable)"
+    fi
   fi
 }
 
@@ -201,10 +400,10 @@ codex-accounts.sh — manage multiple Codex CLI accounts
 
 USAGE
   $0 list
-      Show all saved accounts (from ${DATA_DIR}).
+      Show all saved accounts (from ${DATA_DIR}) and Codex usage.
 
   $0 current
-      Show current and previous accounts from the state.
+      Show current and previous accounts from the state and Codex usage.
 
   $0 save [<name>]
       Copy the current ~/.codex/auth.json into ${DATA_DIR}/<name>.auth.json.
@@ -223,6 +422,7 @@ USAGE
 NOTES
   - Uses only ~/.codex/auth.json; other ~/.codex files are left untouched.
   - If ~/.codex is missing when saving/adding, you'll be prompted to login first.
+  - Usage output requires ChatGPT login tokens; API-key-only logins won’t show usage.
   - Install Codex if needed:  brew install codex
 EOF
 }

@@ -34,6 +34,8 @@ codex-accounts save <name>
 codex-accounts add <name>
 codex-accounts switch <name>
 ```
+`list` and `current` will also display your Codex usage (5h + weekly) when available.
+Usage is fetched directly from the Codex backend and requires ChatGPT login tokens in `~/.codex/auth.json` (API-key-only logins won’t show usage).
 ### Examples
 ```
 # Save your current login
