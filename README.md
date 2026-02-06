@@ -23,7 +23,7 @@ cd codex-cli-account-switcher
 chmod +x codex-accounts.sh
 
 # Optionally make it global
-sudo cp codex-accounts.sh codex_accounts.py codex_accounts_heuristic.py /usr/local/bin/
+sudo cp codex-accounts.sh codex_accounts*.py /usr/local/bin/
 sudo ln -sf /usr/local/bin/codex-accounts.sh /usr/local/bin/codex-accounts
 ```
 
