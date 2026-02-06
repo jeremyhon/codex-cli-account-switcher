@@ -92,3 +92,5 @@ When you run `codex-accounts switch` without a name, the script tries to maximiz
 You can tune via env vars:
 - `CODEX_ACCOUNTS_FIVEH_UNUSABLE_PCT` (default: `5`)
 - `CODEX_ACCOUNTS_UNKNOWN_RESET_TTR_SEC` (default: `315360000` = 10 years; used when reset time is unknown)
+- `CODEX_ACCOUNTS_USAGE_CONCURRENCY` (default: `6`; how many accounts to fetch usage for in parallel)
+- `CODEX_ACCOUNTS_USAGE_CACHE_TTL_SEC` (default: `20`; reuses usage results briefly to speed up repeated `list`/auto-pick)

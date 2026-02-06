@@ -19,6 +19,11 @@ AUTO_SWITCH_FIVEH_UNUSABLE_PCT="${CODEX_ACCOUNTS_FIVEH_UNUSABLE_PCT:-5}"
 # If reset_at is missing, treat it as "very far in the future" for scoring.
 AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC="${CODEX_ACCOUNTS_UNKNOWN_RESET_TTR_SEC:-315360000}" # 10 years
 
+# Usage fetching performance tuning.
+USAGE_FETCH_CONCURRENCY="${CODEX_ACCOUNTS_USAGE_CONCURRENCY:-6}"
+USAGE_CACHE_TTL_SEC="${CODEX_ACCOUNTS_USAGE_CACHE_TTL_SEC:-20}"
+USAGE_CACHE_FILE="${STATE_DIR}/usage-cache.json"
+
 # ------------- utils -------------
 die() { echo "[ERR] $*" >&2; exit 1; }
 note() { echo "[*] $*"; }
@@ -279,85 +284,73 @@ PY
   printf '%s\n' "$output" | sed '/^$/d'
 }
 
-usage_quota_metrics_for_auth() {
-  # Output: "<weekly_remaining> <fiveh_remaining> <weekly_reset_at> <fiveh_reset_at>" (ints).
-  # Remaining values are 0-100; unknown is -1. Reset timestamps are unix seconds; unknown is 0.
-  # Returns empty on failure.
-  local auth_file="$1"
+usage_bulk_tool() {
+  # Bulk usage fetch with parallelism + short-lived caching.
+  # Modes:
+  #   - best: prints the selected account name (for auto-pick)
+  #   - status_blocks: prints blocks:
+  #       @@ <name>
+  #       <line>
+  #       <line>
+  local mode="$1"; shift
   if ! command -v python3 >/dev/null 2>&1; then
     return 0
   fi
 
-  python3 - "$auth_file" "$CODEX_HOME/config.toml" <<'PY'
+  mkdir -p "$STATE_DIR"
+
+  python3 - "$mode" "$USAGE_CACHE_FILE" "$CODEX_HOME/config.toml" \
+    "$USAGE_CACHE_TTL_SEC" "$USAGE_FETCH_CONCURRENCY" \
+    "$AUTO_SWITCH_FIVEH_UNUSABLE_PCT" "$AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC" \
+    "$@" <<'PY'
+import concurrent.futures
+import datetime as dt
 import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 
-auth_file = sys.argv[1]
-config_file = sys.argv[2]
+mode = sys.argv[1]
+cache_file = sys.argv[2]
+config_file = sys.argv[3]
+cache_ttl_sec = int(sys.argv[4])
+concurrency = max(1, int(sys.argv[5]))
+fiveh_unusable = int(sys.argv[6])
+unknown_reset_ttr_sec = int(sys.argv[7])
+auth_files = sys.argv[8:]
 
-try:
-    with open(auth_file, "r", encoding="utf-8") as f:
-        auth = json.load(f)
-except Exception:
-    sys.exit(0)
+def name_for(path: str) -> str:
+    base = os.path.basename(path)
+    return base[:-len(".auth.json")] if base.endswith(".auth.json") else os.path.splitext(base)[0]
 
-tokens = auth.get("tokens") or {}
-access_token = tokens.get("access_token") or ""
-account_id = tokens.get("account_id") or ""
-if not access_token:
-    sys.exit(0)
+def load_base_url() -> str:
+    base_url = "https://chatgpt.com/backend-api"
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m = re.match(r"chatgpt_base_url\s*=\s*(['\"])(.*?)\1", line)
+                    if m:
+                        base_url = m.group(2)
+                        break
+        except Exception:
+            pass
+    base_url = base_url.rstrip("/")
+    if (base_url.startswith("https://chatgpt.com") or base_url.startswith("https://chat.openai.com")) and "/backend-api" not in base_url:
+        base_url = f"{base_url}/backend-api"
+    return base_url
 
-base_url = "https://chatgpt.com/backend-api"
-if os.path.exists(config_file):
-    try:
-        with open(config_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                m = re.match(r"chatgpt_base_url\s*=\s*(['\"])(.*?)\1", line)
-                if m:
-                    base_url = m.group(2)
-                    break
-    except Exception:
-        pass
-
-base_url = base_url.rstrip("/")
-if (base_url.startswith("https://chatgpt.com") or base_url.startswith("https://chat.openai.com")) and "/backend-api" not in base_url:
-    base_url = f"{base_url}/backend-api"
-
+base_url = load_base_url()
 path = "/wham/usage" if "/backend-api" in base_url else "/api/codex/usage"
 url = f"{base_url}{path}"
 
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "User-Agent": "codex-cli",
-}
-if account_id:
-    headers["ChatGPT-Account-Id"] = account_id
-
-req = urllib.request.Request(url, headers=headers)
-try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        body = resp.read().decode("utf-8")
-except Exception:
-    sys.exit(0)
-
-try:
-    payload = json.loads(body)
-except Exception:
-    sys.exit(0)
-
-rate_limit = payload.get("rate_limit") or {}
-
-def remaining_percent(window):
-    if not isinstance(window, dict):
-        return None
-    used = window.get("used_percent")
+def remaining_percent(used) -> int | None:
     if used is None:
         return None
     try:
@@ -370,34 +363,251 @@ def remaining_percent(window):
         remaining = 100.0
     return int(round(remaining))
 
-def reset_at(window):
+def window_info(window):
     if not isinstance(window, dict):
-        return None
-    v = window.get("reset_at")
-    if v is None:
+        return {"used_percent": None, "reset_at": 0, "limit_window_seconds": None}
+    used = window.get("used_percent")
+    reset_at = window.get("reset_at")
+    try:
+        reset_at_i = int(reset_at) if reset_at is not None else 0
+    except Exception:
+        reset_at_i = 0
+    return {
+        "used_percent": used,
+        "reset_at": reset_at_i,
+        "limit_window_seconds": window.get("limit_window_seconds"),
+    }
+
+def fetch_one(auth_file: str) -> dict:
+    try:
+        with open(auth_file, "r", encoding="utf-8") as f:
+            auth = json.load(f)
+    except Exception:
+        return {"ok": False, "reason": "read_failed"}
+
+    tokens = auth.get("tokens") or {}
+    access_token = tokens.get("access_token") or ""
+    account_id = tokens.get("account_id") or ""
+    if not access_token:
+        return {"ok": False, "reason": "no_access_token"}
+
+    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": "codex-cli"}
+    if account_id:
+        headers["ChatGPT-Account-Id"] = account_id
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+    except Exception:
+        return {"ok": False, "reason": "http_failed"}
+
+    try:
+        payload = json.loads(body)
+    except Exception:
+        return {"ok": False, "reason": "parse_failed"}
+
+    rate_limit = payload.get("rate_limit") or {}
+    primary = window_info(rate_limit.get("primary_window"))
+    secondary = window_info(rate_limit.get("secondary_window"))
+
+    fiveh_remaining = remaining_percent(primary.get("used_percent"))
+    weekly_remaining = remaining_percent(secondary.get("used_percent"))
+    fiveh_remaining = fiveh_remaining if fiveh_remaining is not None else -1
+    weekly_remaining = weekly_remaining if weekly_remaining is not None else -1
+
+    return {
+        "ok": True,
+        "primary": primary,
+        "secondary": secondary,
+        "fiveh_remaining": fiveh_remaining,
+        "weekly_remaining": weekly_remaining,
+    }
+
+results_by_path = {}
+use_cache = False
+if cache_ttl_sec > 0 and os.path.exists(cache_file):
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            cached = json.load(f)
+        fetched_at = float(cached.get("fetched_at", 0))
+        cached_paths = cached.get("paths") or []
+        cached_url = cached.get("url") or ""
+        if (time.time() - fetched_at) <= cache_ttl_sec and cached_paths == auth_files and cached_url == url:
+            results_by_path = cached.get("results") or {}
+            # Sanity check shape.
+            if isinstance(results_by_path, dict):
+                use_cache = True
+    except Exception:
+        use_cache = False
+
+if not use_cache:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as ex:
+        futs = {ex.submit(fetch_one, p): p for p in auth_files}
+        for fut in concurrent.futures.as_completed(futs):
+            p = futs[fut]
+            try:
+                results_by_path[p] = fut.result()
+            except Exception:
+                results_by_path[p] = {"ok": False, "reason": "exception"}
+    try:
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(
+                {"fetched_at": time.time(), "paths": auth_files, "url": url, "results": results_by_path},
+                f,
+                separators=(",", ":"),
+            )
+    except Exception:
+        pass
+
+def label_for_seconds(seconds, fallback):
+    if not seconds:
+        return fallback
+    minutes = max(0, int(seconds // 60))
+    minutes_per_hour = 60
+    minutes_per_day = 24 * minutes_per_hour
+    minutes_per_week = 7 * minutes_per_day
+    minutes_per_month = 30 * minutes_per_day
+    rounding_bias = 3
+
+    if minutes <= minutes_per_day + rounding_bias:
+        hours = max(1, (minutes + rounding_bias) // minutes_per_hour)
+        return f"{hours}h"
+    if minutes <= minutes_per_week + rounding_bias:
+        return "weekly"
+    if minutes <= minutes_per_month + rounding_bias:
+        return "monthly"
+    return "annual"
+
+def pretty_label(label):
+    if not label:
+        return label
+    return label[0].upper() + label[1:] if label[0].isalpha() else label
+
+def format_reset(reset_at):
+    if not reset_at:
         return None
     try:
-        return int(v)
+        dt_reset = dt.datetime.fromtimestamp(int(reset_at), tz=dt.timezone.utc).astimezone()
     except Exception:
         return None
+    now_dt = dt.datetime.now().astimezone()
+    t = dt_reset.strftime("%H:%M")
+    if dt_reset.date() == now_dt.date():
+        return t
+    day = dt_reset.strftime("%d").lstrip("0")
+    month = dt_reset.strftime("%b")
+    return f"{t} on {day} {month}"
 
-primary = rate_limit.get("primary_window")
-secondary = rate_limit.get("secondary_window")
+def format_window(window, fallback_label):
+    if not isinstance(window, dict):
+        return None
+    used = window.get("used_percent")
+    if used is None:
+        return None
+    label = pretty_label(label_for_seconds(window.get("limit_window_seconds"), fallback_label))
+    reset = format_reset(window.get("reset_at"))
+    if reset:
+        return f"{label} limit: {used}% used (resets {reset})"
+    return f"{label} limit: {used}% used"
 
-fiveh_remaining = remaining_percent(primary)
-weekly_remaining = remaining_percent(secondary)
-fiveh_reset = reset_at(primary)
-weekly_reset = reset_at(secondary)
-
-if fiveh_remaining is None and weekly_remaining is None:
+if mode == "status_blocks":
+    for p in auth_files:
+        r = results_by_path.get(p) or {}
+        print(f"@@ {name_for(p)}")
+        if not r.get("ok"):
+            print("(unavailable)")
+            continue
+        primary = format_window(r.get("primary") or {}, "5h")
+        secondary = format_window(r.get("secondary") or {}, "weekly")
+        if primary:
+            print(primary)
+        if secondary:
+            print(secondary)
+        if not primary and not secondary:
+            print("(unavailable)")
     sys.exit(0)
 
-weekly_remaining = weekly_remaining if weekly_remaining is not None else -1
-fiveh_remaining = fiveh_remaining if fiveh_remaining is not None else -1
-weekly_reset = weekly_reset if weekly_reset is not None else 0
-fiveh_reset = fiveh_reset if fiveh_reset is not None else 0
+if mode == "best":
+    now = int(time.time())
+    best = None
+    fallback = None
 
-print(f"{weekly_remaining} {fiveh_remaining} {weekly_reset} {fiveh_reset}")
+    for p in auth_files:
+        r = results_by_path.get(p) or {}
+        if not r.get("ok"):
+            continue
+        weekly = int(r.get("weekly_remaining", -1))
+        fiveh = int(r.get("fiveh_remaining", -1))
+        if weekly < 0 or fiveh < 0:
+            continue
+
+        primary = r.get("primary") or {}
+        secondary = r.get("secondary") or {}
+
+        wreset = int(secondary.get("reset_at") or 0)
+        freset = int(primary.get("reset_at") or 0)
+
+        ttr_weekly = unknown_reset_ttr_sec
+        if wreset > 0:
+            ttr_weekly = wreset - now
+            if ttr_weekly < 1:
+                ttr_weekly = 1
+
+        ttr_fiveh = unknown_reset_ttr_sec
+        if freset > 0:
+            ttr_fiveh = freset - now
+            if ttr_fiveh < 1:
+                ttr_fiveh = 1
+
+        # Fallback candidate, even if 5h is unusable.
+        if fallback is None:
+            fallback = (fiveh, ttr_fiveh, p)
+        else:
+            bfiveh, bttr, _ = fallback
+            if fiveh > bfiveh or (fiveh == bfiveh and ttr_fiveh < bttr):
+                fallback = (fiveh, ttr_fiveh, p)
+
+        if fiveh <= fiveh_unusable:
+            continue
+
+        if best is None:
+            best = (weekly, fiveh, ttr_weekly, wreset, p)
+            continue
+
+        bweekly, bfiveh, bttr, bwreset, _ = best
+
+        # Maximize weekly urgency: weekly/ttr_weekly
+        lhs = weekly * bttr
+        rhs = bweekly * ttr_weekly
+        if lhs > rhs:
+            best = (weekly, fiveh, ttr_weekly, wreset, p)
+        elif lhs == rhs:
+            # Tie-break: weekly remaining, then 5h remaining, then earlier weekly reset.
+            if weekly > bweekly:
+                best = (weekly, fiveh, ttr_weekly, wreset, p)
+            elif weekly == bweekly:
+                if fiveh > bfiveh:
+                    best = (weekly, fiveh, ttr_weekly, wreset, p)
+                elif fiveh == bfiveh:
+                    if wreset and bwreset:
+                        if wreset < bwreset:
+                            best = (weekly, fiveh, ttr_weekly, wreset, p)
+                    elif wreset and not bwreset:
+                        best = (weekly, fiveh, ttr_weekly, wreset, p)
+
+    chosen_path = None
+    if best is not None:
+        chosen_path = best[-1]
+    elif fallback is not None:
+        chosen_path = fallback[-1]
+
+    if chosen_path:
+        print(name_for(chosen_path))
+        sys.exit(0)
+    sys.exit(1)
+
+sys.exit(2)
 PY
 }
 
@@ -405,123 +615,14 @@ pick_best_account_by_quota() {
   ensure_dirs
   shopt -s nullglob
 
-  local now; now="$(date +%s)"
+  local -a files=()
+  files=( "$DATA_DIR"/*.auth.json )
+  (( ${#files[@]} == 0 )) && return 1
 
-  # Primary selection: maximize weekly urgency = weekly_remaining / time_to_weekly_reset.
-  # Compare ratios by cross-multiplication to avoid floats:
-  #   w1/t1 > w2/t2  <=>  w1*t2 > w2*t1
-  local best_name=""
-  local best_weekly=-1
-  local best_fiveh=-1
-  local best_ttr_weekly=$AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC
-
-  # Fallback: if all accounts are "unusable" by 5h, pick the one with max 5h remaining anyway.
-  local fallback_name=""
-  local fallback_fiveh=-1
-  local fallback_ttr_fiveh=$AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC
-
-  for f in "$DATA_DIR"/*.auth.json; do
-    local name; name="$(basename "${f%%.auth.json}" .auth.json)"
-    local line=""
-    line="$(usage_quota_metrics_for_auth "$f" || true)"
-    [[ -z "$line" ]] && continue
-
-    local weekly fiveh wreset freset
-    read -r weekly fiveh wreset freset <<<"$line"
-    [[ -z "${weekly:-}" || -z "${fiveh:-}" ]] && continue
-
-    # Exclude accounts with missing usage data.
-    (( weekly >= 0 )) || continue
-    (( fiveh >= 0 )) || continue
-
-    local ttr_weekly=$AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC
-    if [[ "${wreset:-0}" =~ ^[0-9]+$ ]] && (( wreset > 0 )); then
-      ttr_weekly=$(( wreset - now ))
-      # If server time skew yields a past reset_at, treat as immediate.
-      (( ttr_weekly < 1 )) && ttr_weekly=1
-    fi
-
-    local ttr_fiveh=$AUTO_SWITCH_UNKNOWN_RESET_TTR_SEC
-    if [[ "${freset:-0}" =~ ^[0-9]+$ ]] && (( freset > 0 )); then
-      ttr_fiveh=$(( freset - now ))
-      (( ttr_fiveh < 1 )) && ttr_fiveh=1
-    fi
-
-    # Maintain fallback for "everything is unusable by 5h" cases.
-    if (( fiveh > fallback_fiveh )); then
-      fallback_name="$name"
-      fallback_fiveh=$fiveh
-      fallback_ttr_fiveh=$ttr_fiveh
-    elif (( fiveh == fallback_fiveh )); then
-      if (( ttr_fiveh < fallback_ttr_fiveh )); then
-        fallback_name="$name"
-        fallback_ttr_fiveh=$ttr_fiveh
-      fi
-    fi
-
-    # Hard filter: can't effectively use this account right now if 5h is too low.
-    if (( fiveh <= AUTO_SWITCH_FIVEH_UNUSABLE_PCT )); then
-      continue
-    fi
-
-    if [[ -z "$best_name" ]]; then
-      best_name="$name"
-      best_weekly=$weekly
-      best_fiveh=$fiveh
-      best_ttr_weekly=$ttr_weekly
-      continue
-    fi
-
-    # Compare weekly urgency: weekly/ttr_weekly
-    local lhs=$(( weekly * best_ttr_weekly ))
-    local rhs=$(( best_weekly * ttr_weekly ))
-    if (( lhs > rhs )); then
-      best_name="$name"
-      best_weekly=$weekly
-      best_fiveh=$fiveh
-      best_ttr_weekly=$ttr_weekly
-    elif (( lhs == rhs )); then
-      # If urgency is the same, prefer more weekly remaining (less switching),
-      # then more 5h remaining, then earlier weekly reset.
-      if (( weekly > best_weekly )); then
-        best_name="$name"
-        best_weekly=$weekly
-        best_fiveh=$fiveh
-        best_ttr_weekly=$ttr_weekly
-      elif (( weekly == best_weekly )); then
-        if (( fiveh > best_fiveh )); then
-          best_name="$name"
-          best_fiveh=$fiveh
-        elif (( fiveh == best_fiveh )); then
-          if (( ttr_weekly < best_ttr_weekly )); then
-            best_name="$name"
-            best_ttr_weekly=$ttr_weekly
-          fi
-        fi
-      fi
-    fi
-  done
-
-  if [[ -n "$best_name" ]]; then
-    echo "$best_name"
-    return 0
-  fi
-
-  # If we couldn't find any "usable" account but we do have candidates, fall back to max 5h remaining.
-  [[ -n "$fallback_name" ]] || return 1
-  echo "$fallback_name"
-}
-
-print_usage_summary_for_auth() {
-  local auth_file="$1"
-  local lines=""
-  lines="$(usage_status_lines_for_auth "$auth_file")"
-  if [[ -n "$lines" ]]; then
-    echo "  Usage:"
-    printf '%s\n' "$lines" | sed 's/^/    /'
-  else
-    echo "  Usage: (unavailable)"
-  fi
+  local out=""
+  out="$(usage_bulk_tool best "${files[@]}" || true)"
+  [[ -n "${out:-}" ]] || return 1
+  echo "$out"
 }
 
 prompt_account_name() {
@@ -613,13 +714,42 @@ resolve_current_name_or_prompt() {
 cmd_list() {
   ensure_dirs
   shopt -s nullglob
-  local any=0
-  for f in "$DATA_DIR"/*.auth.json; do
-    any=1
-    echo " - $(basename "${f%%.auth.json}" .auth.json)"
-    print_usage_summary_for_auth "$f"
-  done
-  [[ $any -eq 0 ]] && echo "(no accounts saved yet)"
+  local -a files=()
+  files=( "$DATA_DIR"/*.auth.json )
+  if (( ${#files[@]} == 0 )); then
+    echo "(no accounts saved yet)"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    for f in "${files[@]}"; do
+      echo " - $(basename "${f%%.auth.json}" .auth.json)"
+      echo "  Usage: (unavailable)"
+    done
+    return 0
+  fi
+
+  # One python process; concurrent HTTP requests; cache reused briefly across runs.
+  local blocks=""
+  blocks="$(usage_bulk_tool status_blocks "${files[@]}" || true)"
+  if [[ -z "${blocks//[[:space:]]/}" ]]; then
+    for f in "${files[@]}"; do
+      echo " - $(basename "${f%%.auth.json}" .auth.json)"
+      echo "  Usage: (unavailable)"
+    done
+    return 0
+  fi
+
+  local current_name=""
+  while IFS= read -r line; do
+    if [[ "$line" == "@@"* ]]; then
+      current_name="${line#@@ }"
+      echo " - ${current_name}"
+      echo "  Usage:"
+    else
+      printf '    %s\n' "$line"
+    fi
+  done <<<"$blocks"
 }
 
 cmd_current() {
