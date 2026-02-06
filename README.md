@@ -48,6 +48,9 @@ codex-accounts save tazrin
 
 # Switch between accounts
 codex-accounts switch bashar
+
+# Auto-pick (no name) chooses an account based on usage + reset times
+codex-accounts switch
 ```
 ## 📁 Data Locations
 Codex stores its session data inside `~/.codex`.
@@ -76,3 +79,16 @@ It’s safe to use — only `auth.json` is swapped; other Codex files are left u
 - Simple shell-only dependency (`bash`).
 - Helpful prompts if Codex isn’t installed or logged in yet.
 - You can safely share this across machines (just copy `~/codex-data`).
+
+## 🧪 Auto-pick Heuristic (switch without a name)
+When you run `codex-accounts switch` without a name, the script tries to maximize total usable weekly quota over time:
+- It excludes accounts where usage data is unavailable.
+- It excludes accounts where the 5h window remaining is too low to be useful (default: `<= 5%`).
+- Among the remaining accounts, it picks the one with the highest **weekly urgency**:
+  `weekly_remaining / time_to_weekly_reset`
+  (this biases toward draining accounts whose weekly window will refresh sooner).
+- If every account is excluded by the 5h filter, it falls back to the account with the most 5h remaining.
+
+You can tune via env vars:
+- `CODEX_ACCOUNTS_FIVEH_UNUSABLE_PCT` (default: `5`)
+- `CODEX_ACCOUNTS_UNKNOWN_RESET_TTR_SEC` (default: `315360000` = 10 years; used when reset time is unknown)
