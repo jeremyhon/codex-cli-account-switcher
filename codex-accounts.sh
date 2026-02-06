@@ -714,6 +714,18 @@ resolve_current_name_or_prompt() {
 cmd_list() {
   ensure_dirs
   shopt -s nullglob
+  load_state
+
+  local marker_for_name
+  marker_for_name() {
+    local name="$1"
+    if [[ -n "${CURRENT:-}" && "$name" == "$CURRENT" ]]; then
+      printf '*'
+    else
+      printf '-'
+    fi
+  }
+
   local -a files=()
   files=( "$DATA_DIR"/*.auth.json )
   if (( ${#files[@]} == 0 )); then
@@ -723,7 +735,8 @@ cmd_list() {
 
   if ! command -v python3 >/dev/null 2>&1; then
     for f in "${files[@]}"; do
-      echo " - $(basename "${f%%.auth.json}" .auth.json)"
+      local name; name="$(basename "${f%%.auth.json}" .auth.json)"
+      echo " $(marker_for_name "$name") ${name}"
       echo "  Usage: (unavailable)"
     done
     return 0
@@ -734,7 +747,8 @@ cmd_list() {
   blocks="$(usage_bulk_tool status_blocks "${files[@]}" || true)"
   if [[ -z "${blocks//[[:space:]]/}" ]]; then
     for f in "${files[@]}"; do
-      echo " - $(basename "${f%%.auth.json}" .auth.json)"
+      local name; name="$(basename "${f%%.auth.json}" .auth.json)"
+      echo " $(marker_for_name "$name") ${name}"
       echo "  Usage: (unavailable)"
     done
     return 0
@@ -744,7 +758,7 @@ cmd_list() {
   while IFS= read -r line; do
     if [[ "$line" == "@@"* ]]; then
       current_name="${line#@@ }"
-      echo " - ${current_name}"
+      echo " $(marker_for_name "$current_name") ${current_name}"
       echo "  Usage:"
     else
       printf '    %s\n' "$line"
