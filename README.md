@@ -19,11 +19,12 @@ However, the feature hasn’t yet been merged or prioritized, so this standalone
 ```bash
 # Clone and install
 git clone https://github.com/bashar94/codex-cli-account-switcher.git
-cd codex-accounts-switcher
+cd codex-cli-account-switcher
 chmod +x codex-accounts.sh
 
 # Optionally make it global
-sudo mv codex-accounts.sh /usr/local/bin/codex-accounts
+sudo cp codex-accounts.sh codex_accounts.py codex_accounts_heuristic.py /usr/local/bin/
+sudo ln -sf /usr/local/bin/codex-accounts.sh /usr/local/bin/codex-accounts
 ```
 
 ## 🚀 Usage
@@ -67,6 +68,7 @@ It’s safe to use — only `auth.json` is swapped; other Codex files are left u
 ## ⚙️ Requirements
 - macOS / Linux
 - `bash`
+- `python3`
 - Codex CLI installed:
   - macOS: `brew install codex`
   - Linux: use your package manager or follow the [Codex CLI docs](https://developers.openai.com/codex/cli/)
@@ -76,7 +78,7 @@ It’s safe to use — only `auth.json` is swapped; other Codex files are left u
 - Automatically backs up the current account before changing.
 - Shows the current and previous account states.
 - Works cross-platform: macOS, Linux, WSL.
-- Simple shell-only dependency (`bash`).
+- Lightweight runtime deps (`bash` + `python3`).
 - Helpful prompts if Codex isn’t installed or logged in yet.
 - You can safely share this across machines (just copy `~/codex-data`).
 
@@ -94,3 +96,9 @@ You can tune via env vars:
 - `CODEX_ACCOUNTS_UNKNOWN_RESET_TTR_SEC` (default: `315360000` = 10 years; used when reset time is unknown)
 - `CODEX_ACCOUNTS_USAGE_CONCURRENCY` (default: `6`; how many accounts to fetch usage for in parallel)
 - `CODEX_ACCOUNTS_USAGE_CACHE_TTL_SEC` (default: `20`; reuses usage results briefly to speed up repeated `list`/auto-pick)
+
+You can swap heuristics without changing core logic:
+- `CODEX_ACCOUNTS_HEURISTIC=<module>[:function]`
+- `CODEX_ACCOUNTS_HEURISTIC=/path/to/file.py[:function]`
+
+Default heuristic implementation lives in `codex_accounts_heuristic.py`.
