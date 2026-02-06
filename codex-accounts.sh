@@ -44,6 +44,55 @@ auth_path_for() {
   echo "${DATA_DIR}/${name}.auth.json"
 }
 
+auth_identity_for_file() {
+  # Prints a stable identity string for a ChatGPT login (account_id/user_id) if available.
+  # Returns empty if identity can't be determined (e.g. API-key-only auth).
+  local auth_file="$1"
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  python3 - "$auth_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+tokens = data.get("tokens") or {}
+account_id = tokens.get("account_id") or ""
+user_id = tokens.get("user_id") or ""
+
+if account_id:
+    print(f"account_id:{account_id}")
+elif user_id:
+    print(f"user_id:{user_id}")
+else:
+    # API-key-only auth (or unknown format) -> no stable identity.
+    sys.exit(0)
+PY
+}
+
+match_saved_account_by_identity() {
+  local identity="$1"
+  [[ -z "$identity" ]] && return 1
+  shopt -s nullglob
+  for f in "$DATA_DIR"/*.auth.json; do
+    local other_id
+    other_id="$(auth_identity_for_file "$f")"
+    if [[ -n "$other_id" && "$other_id" == "$identity" ]]; then
+      local name; name="$(basename "${f%%.auth.json}" .auth.json)"
+      echo "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
 assert_codex_present_or_hint() {
   if [[ ! -d "$CODEX_HOME" ]]; then
     die "~/.codex not found. You likely haven't logged in yet.
@@ -394,6 +443,17 @@ backup_current_to() {
 
   local dest; dest="$(auth_path_for "$name")"
 
+  if [[ -f "$dest" ]]; then
+    local current_id dest_id
+    current_id="$(auth_identity_for_file "$AUTH_FILE")"
+    dest_id="$(auth_identity_for_file "$dest")"
+    if [[ -n "$current_id" && -n "$dest_id" && "$current_id" != "$dest_id" ]]; then
+      die "Refusing to overwrite '${name}': current auth belongs to a different account.
+If you logged in outside the switcher, run: $0 save <new-name>
+Or switch after syncing with: $0 switch <name>"
+    fi
+  fi
+
   note "Saving current auth.json to ${dest}..."
   cp -p "$AUTH_FILE" "$dest"
   ok "Saved."
@@ -413,6 +473,38 @@ extract_to_codex() {
 resolve_current_name_or_prompt() {
   # If CURRENT unknown but ~/.codex exists, ask user to name it so we can save it.
   load_state
+
+  if [[ -f "$AUTH_FILE" ]]; then
+    local current_id; current_id="$(auth_identity_for_file "$AUTH_FILE")"
+    if [[ -n "$current_id" ]]; then
+      local matched=""
+      matched="$(match_saved_account_by_identity "$current_id" || true)"
+      if [[ -n "$matched" ]]; then
+        if [[ "${CURRENT:-}" != "$matched" ]]; then
+          note "Detected current auth matches saved account '${matched}'. Updating state."
+          PREVIOUS="${CURRENT:-}"
+          CURRENT="$matched"
+          save_state "$CURRENT" "$PREVIOUS"
+        fi
+        return 0
+      fi
+
+      # If state says we're on CURRENT but auth.json identity doesn't match, clear CURRENT so we prompt/back up safely.
+      if [[ -n "${CURRENT:-}" ]]; then
+        local current_saved_id=""
+        local current_saved_path=""
+        current_saved_path="$(auth_path_for "$CURRENT")"
+        if [[ -f "$current_saved_path" ]]; then
+          current_saved_id="$(auth_identity_for_file "$current_saved_path")"
+        fi
+        if [[ -n "$current_saved_id" && "$current_saved_id" != "$current_id" ]]; then
+          note "Current auth doesn't match saved '${CURRENT}'."
+          CURRENT=""
+        fi
+      fi
+    fi
+  fi
+
   if [[ -z "${CURRENT:-}" && -f "$AUTH_FILE" ]]; then
     local named; named="$(prompt_account_name)"
     backup_current_to "$named"
