@@ -707,7 +707,7 @@ cmd_switch() {
 
   load_state
   if [[ -n "${CURRENT:-}" && "$CURRENT" == "$target" ]]; then
-    ok "Already on account with most available quota: ${CURRENT}"
+    ok "Already on auto-selected account: ${CURRENT}"
     return 0
   fi
 
