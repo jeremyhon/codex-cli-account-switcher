@@ -80,6 +80,45 @@ def match_saved_account_by_identity(identity: str) -> str | None:
     return None
 
 
+def maybe_update_state_from_active_auth() -> str | None:
+    if not AUTH_FILE.exists():
+        return None
+
+    current_id = auth_identity_for_file(AUTH_FILE)
+    if not current_id:
+        return None
+
+    matched = match_saved_account_by_identity(current_id)
+    if not matched:
+        return None
+
+    current, previous = load_state(STATE_FILE, STATE_LOCK_FILE)
+    if current != matched:
+        note(f"Detected current auth matches saved account '{matched}'. Updating state.")
+        save_state(STATE_FILE, STATE_LOCK_FILE, matched, current or previous)
+    return matched
+
+
+def maybe_sync_saved_auth_from_active(matched_name: str | None, prog: str) -> None:
+    if not matched_name:
+        return
+
+    saved_auth = auth_path_for(matched_name)
+    if not saved_auth.is_file() or not AUTH_FILE.is_file():
+        return
+
+    try:
+        same_content = AUTH_FILE.read_bytes() == saved_auth.read_bytes()
+    except Exception:
+        return
+
+    if same_content:
+        return
+
+    note(f"Detected updated active auth for '{matched_name}'. Syncing saved profile.")
+    backup_current_to(matched_name, prog)
+
+
 def assert_codex_present_or_hint() -> None:
     if not CODEX_HOME.is_dir():
         die(
@@ -280,28 +319,22 @@ def extract_to_codex(authfile: Path) -> None:
 def resolve_current_name_or_prompt(prog: str) -> tuple[str, str]:
     current, previous = load_state(STATE_FILE, STATE_LOCK_FILE)
 
+    matched = maybe_update_state_from_active_auth()
+    if matched:
+        return load_state(STATE_FILE, STATE_LOCK_FILE)
+
     if AUTH_FILE.exists():
         current_id = auth_identity_for_file(AUTH_FILE)
-        if current_id:
-            matched = match_saved_account_by_identity(current_id)
-            if matched:
-                if current != matched:
-                    note(f"Detected current auth matches saved account '{matched}'. Updating state.")
-                    previous = current
-                    current = matched
-                    save_state(STATE_FILE, STATE_LOCK_FILE, current, previous)
-                return current, previous
-
-            if current:
-                current_saved_path = auth_path_for(current)
-                current_saved_id = (
-                    auth_identity_for_file(current_saved_path)
-                    if current_saved_path.exists()
-                    else None
-                )
-                if current_saved_id and current_saved_id != current_id:
-                    note(f"Current auth doesn't match saved '{current}'.")
-                    current = ""
+        if current_id and current:
+            current_saved_path = auth_path_for(current)
+            current_saved_id = (
+                auth_identity_for_file(current_saved_path)
+                if current_saved_path.exists()
+                else None
+            )
+            if current_saved_id and current_saved_id != current_id:
+                note(f"Current auth doesn't match saved '{current}'.")
+                current = ""
 
     if not current and AUTH_FILE.exists():
         named = prompt_account_name()
@@ -314,8 +347,9 @@ def resolve_current_name_or_prompt(prog: str) -> tuple[str, str]:
 
 
 def cmd_list(prog: str) -> None:
-    del prog
     ensure_dirs()
+    matched = maybe_update_state_from_active_auth()
+    maybe_sync_saved_auth_from_active(matched, prog)
     current, _ = load_state(STATE_FILE, STATE_LOCK_FILE)
 
     files = sorted(DATA_DIR.glob("*.auth.json"))
@@ -331,15 +365,14 @@ def cmd_list(prog: str) -> None:
         print("  Usage:")
 
         lines = format_usage_lines(results.get(str(auth_file)) or {})
-        if lines:
-            for line in lines:
-                print(f"    {line}")
-        else:
-            print("    (unavailable)")
+        for line in lines:
+            print(f"    {line}")
 
 
 def cmd_current(prog: str) -> None:
-    del prog
+    ensure_dirs()
+    matched = maybe_update_state_from_active_auth()
+    maybe_sync_saved_auth_from_active(matched, prog)
     current, previous = load_state(STATE_FILE, STATE_LOCK_FILE)
 
     if current:
@@ -355,11 +388,8 @@ def cmd_current(prog: str) -> None:
         print("Usage (auth.json):")
 
     lines = usage_status_lines_for_auth(AUTH_FILE)
-    if lines:
-        for line in lines:
-            print(f"  {line}")
-    else:
-        print("  (unavailable)")
+    for line in lines:
+        print(f"  {line}")
 
 
 def cmd_save(args: list[str], prog: str) -> None:
@@ -460,6 +490,7 @@ USAGE
 NOTES
   - Uses only ~/.codex/auth.json; other ~/.codex files are left untouched.
   - If ~/.codex is missing when saving/adding, you'll be prompted to login first.
+  - list/current auto-sync a matched saved profile when active auth has newer tokens.
   - Usage output requires ChatGPT login tokens; API-key-only logins won't show usage.
   - Install Codex if needed:  brew install codex
   - Heuristic override: set CODEX_ACCOUNTS_HEURISTIC to module[:func] or /path/file.py[:func]

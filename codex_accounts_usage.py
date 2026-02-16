@@ -144,6 +144,13 @@ def fetch_usage_bulk(
 
     url = usage_url(config_file)
     paths = [str(p) for p in auth_files]
+    auth_fingerprints: list[str] = []
+    for p in auth_files:
+        try:
+            stat = p.stat()
+            auth_fingerprints.append(f"{p}:{stat.st_mtime_ns}:{stat.st_size}")
+        except Exception:
+            auth_fingerprints.append(f"{p}:missing")
     cache_lock_file = cache_file.with_suffix(cache_file.suffix + ".lock")
 
     # Read-through cache with lock.
@@ -154,10 +161,12 @@ def fetch_usage_bulk(
                 fetched_at = float(cached.get("fetched_at", 0))
                 cached_paths = cached.get("paths") or []
                 cached_url = cached.get("url") or ""
+                cached_auth_fingerprints = cached.get("auth_fingerprints") or []
                 if (
                     (time.time() - fetched_at) <= cache_ttl_sec
                     and cached_paths == paths
                     and cached_url == url
+                    and cached_auth_fingerprints == auth_fingerprints
                 ):
                     results = cached.get("results") or {}
                     if isinstance(results, dict):
@@ -190,6 +199,7 @@ def fetch_usage_bulk(
                             "fetched_at": time.time(),
                             "paths": paths,
                             "url": url,
+                            "auth_fingerprints": auth_fingerprints,
                             "results": results,
                         },
                         separators=(",", ":"),
@@ -259,9 +269,31 @@ def format_window(window: dict[str, Any], fallback_label: str) -> str | None:
     return f"{label} limit: {used}% used"
 
 
+def format_failure_line(result: dict[str, Any]) -> str:
+    reason = str(result.get("reason") or "").strip()
+
+    if reason == "http_401":
+        return "Auth check: 401 Unauthorized (token invalid or expired)"
+    if reason.startswith("http_"):
+        return f"Usage fetch failed: HTTP {reason.split('_', 1)[1]}"
+    if reason == "no_access_token":
+        if result.get("has_api_key"):
+            return "Auth check: missing ChatGPT access token (API-key-only auth)"
+        return "Auth check: missing ChatGPT access token"
+    if reason == "auth_missing":
+        return "Auth check: auth.json missing"
+    if reason == "auth_read_failed":
+        return "Auth check: couldn't read auth.json"
+    if reason == "payload_parse_failed":
+        return "Usage fetch failed: invalid response payload"
+    if reason == "http_failed":
+        return "Usage fetch failed: network error"
+    return f"Usage unavailable ({reason or 'unknown error'})"
+
+
 def format_usage_lines(result: dict[str, Any]) -> list[str]:
     if not result.get("ok"):
-        return []
+        return [format_failure_line(result)]
     lines: list[str] = []
     primary = format_window(result.get("primary") or {}, "5h")
     secondary = format_window(result.get("secondary") or {}, "weekly")
@@ -269,4 +301,6 @@ def format_usage_lines(result: dict[str, Any]) -> list[str]:
         lines.append(primary)
     if secondary:
         lines.append(secondary)
+    if not lines:
+        return ["Usage unavailable (missing rate-limit windows)"]
     return lines
